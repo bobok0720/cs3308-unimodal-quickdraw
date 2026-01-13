@@ -3,25 +3,35 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict
+from typing import List
 
-import torch
-from sklearn.metrics import f1_score
-from torch import nn
-from torch.utils.data import DataLoader
 
-from src.recognition.dataset import CoordRasterDataset, load_manifest
-from src.recognition.model import build_resnet18
-from src.recognition.eval import evaluate
-from src.utils.paths import ensure_dir
-from src.utils.seed import set_seed
+@dataclass
+class ManifestSample:
+    path: str
+    label: int
+    class_name: str
+    split: str
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train recognizer from coords")
-    parser.add_argument("--coord_root", type=str, required=True, help="Coordinate root")
+    parser.add_argument(
+        "--rec_out",
+        type=str,
+        default=None,
+        help="Directory containing manifest_train.csv, manifest_val.csv, manifest_test.csv, classes.txt",
+    )
+    parser.add_argument(
+        "--coord_root",
+        type=str,
+        default=None,
+        help="Legacy name for manifest directory (use --rec_out instead)",
+    )
     parser.add_argument("--out_dir", type=str, default="outputs/recognition")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch", type=int, default=64)
@@ -32,30 +42,94 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _load_manifest(csv_path: Path, split: str) -> List[ManifestSample]:
+    with csv_path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {"path", "label", "class"}
+        if reader.fieldnames is None:
+            raise ValueError(f"Manifest missing header: {csv_path}")
+        missing = required - set(reader.fieldnames)
+        if missing:
+            raise ValueError(f"Manifest missing columns {missing}: {csv_path}")
+        samples = []
+        for row in reader:
+            if not row.get("path"):
+                continue
+            samples.append(
+                ManifestSample(
+                    path=row["path"],
+                    label=int(row["label"]),
+                    class_name=row["class"],
+                    split=split,
+                )
+            )
+    return samples
+
+
+def _print_manifest_preview(csv_path: Path) -> None:
+    lines = csv_path.read_text().splitlines()
+    data_lines = [line for line in lines[1:] if line.strip()]
+    print(f"Manifest {csv_path} has {len(data_lines)} data lines.")
+    if data_lines:
+        print("First 3 data lines:")
+        for line in data_lines[:3]:
+            print(line)
+
+
 def main() -> None:
     args = parse_args()
+
+    from torch import nn
+    from torch.utils.data import DataLoader
+    import torch
+
+    from src.recognition.dataset import CoordRasterDataset
+    from src.recognition.eval import evaluate
+    from src.recognition.model import build_resnet18
+    from src.utils.paths import ensure_dir
+    from src.utils.seed import set_seed
+
     set_seed(args.seed)
 
+    if args.rec_out is None and args.coord_root is None:
+        raise ValueError("Provide --rec_out (preferred) or --coord_root (legacy) with manifest files.")
+
     out_dir = ensure_dir(Path(args.out_dir))
-    manifest_dir = Path(args.coord_root)
+    manifest_dir = Path(args.rec_out) if args.rec_out is not None else Path(args.coord_root)
 
     train_manifest = manifest_dir / "manifest_train.csv"
     val_manifest = manifest_dir / "manifest_val.csv"
     test_manifest = manifest_dir / "manifest_test.csv"
     classes_path = manifest_dir / "classes.txt"
 
-    if not train_manifest.exists():
-        raise FileNotFoundError(f"Missing manifest: {train_manifest}")
+    missing = [
+        path
+        for path in (train_manifest, val_manifest, test_manifest, classes_path)
+        if not path.exists()
+    ]
+    if missing:
+        missing_list = "\n".join(str(path) for path in missing)
+        raise FileNotFoundError(
+            "Missing manifest files. Ensure --rec_out points to a folder containing:\n"
+            f"{missing_list}"
+        )
 
     classes = classes_path.read_text().strip().splitlines()
 
-    train_samples = load_manifest(train_manifest)
-    val_samples = load_manifest(val_manifest)
-    test_samples = load_manifest(test_manifest)
+    train_samples = _load_manifest(train_manifest, "train")
+    val_samples = _load_manifest(val_manifest, "val")
+    test_samples = _load_manifest(test_manifest, "test")
 
     train_dataset = CoordRasterDataset(train_samples, img_size=args.img_size)
     val_dataset = CoordRasterDataset(val_samples, img_size=args.img_size)
     test_dataset = CoordRasterDataset(test_samples, img_size=args.img_size)
+
+    if len(train_dataset) == 0 or len(val_dataset) == 0:
+        if len(train_dataset) == 0:
+            _print_manifest_preview(train_manifest)
+        if len(val_dataset) == 0:
+            _print_manifest_preview(val_manifest)
+        raise RuntimeError("Empty train/val dataset. Check the manifest contents above.")
 
     train_loader = DataLoader(
         train_dataset,
