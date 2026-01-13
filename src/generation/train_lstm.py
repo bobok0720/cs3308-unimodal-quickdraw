@@ -1,103 +1,168 @@
-import os, json, time
+"""Train a conditional LSTM generator."""
+
+from __future__ import annotations
+
+import argparse
+import json
 from pathlib import Path
+
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import DataLoader
-from src.generation.dataset import SketchCoordDataset
 
-class CondLSTM(nn.Module):
-    def __init__(self, n_classes, emb_dim=32, hid=256):
+from src.generation.dataset import SketchDataset, collate_sketch, load_manifest
+from src.utils.paths import ensure_dir
+from src.utils.seed import set_seed
+
+
+class ConditionalLSTM(nn.Module):
+    def __init__(self, num_classes: int, embed_dim: int = 64, hidden_dim: int = 256):
         super().__init__()
-        self.emb = nn.Embedding(n_classes, emb_dim)
-        self.lstm = nn.LSTM(input_size=5 + emb_dim, hidden_size=hid, batch_first=True)
-        self.out_xy = nn.Linear(hid, 2)
-        self.out_pen = nn.Linear(hid, 3)  # cont / stroke_end / eos
+        self.embedding = nn.Embedding(num_classes, embed_dim)
+        self.lstm = nn.LSTM(input_size=5 + embed_dim, hidden_size=hidden_dim, batch_first=True)
+        self.fc_xy = nn.Linear(hidden_dim, 2)
+        self.fc_pen = nn.Linear(hidden_dim, 3)
 
-    def forward(self, x, y):
-        e = self.emb(y)[:, None, :].expand(x.size(0), x.size(1), -1)
-        h, _ = self.lstm(torch.cat([x, e], dim=-1))
-        return self.out_xy(h), self.out_pen(h)
+    def forward(self, x: torch.Tensor, labels: torch.Tensor):
+        emb = self.embedding(labels)
+        emb = emb[:, None, :].expand(-1, x.size(1), -1)
+        lstm_in = torch.cat([x, emb], dim=-1)
+        out, _ = self.lstm(lstm_in)
+        xy = self.fc_xy(out)
+        pen = self.fc_pen(out)
+        return xy, pen
 
-def main():
-    REC_OUT = Path(os.environ.get("REC_OUT", "/content/drive/MyDrive/cs3308_quickdraw/outputs/recognition_from_coords"))
-    OUT_DIR = Path(os.environ.get("OUT_DIR", "/content/drive/MyDrive/cs3308_quickdraw/outputs/generation"))
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    classes = (REC_OUT / "classes.txt").read_text().splitlines()
-    n_classes = len(classes)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train conditional LSTM")
+    parser.add_argument("--rec_out", type=str, required=True, help="Path to recognition manifest dir")
+    parser.add_argument("--out_dir", type=str, default="outputs/generation")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
 
-    train_csv = str(REC_OUT / "manifest_train.csv")
-    val_csv   = str(REC_OUT / "manifest_val.csv")
 
-    batch  = int(os.environ.get("BATCH", "64"))
-    epochs = int(os.environ.get("EPOCHS", "1"))
-    lr     = float(os.environ.get("LR", "1e-3"))
+def masked_loss(pred_xy, target_xy, pred_pen, target_pen, lengths):
+    batch_size, seq_len, _ = pred_xy.shape
+    mask = torch.arange(seq_len, device=lengths.device)[None, :] < lengths[:, None]
+    mask = mask.float()
 
-    dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    print("Device:", dev, "| classes:", n_classes)
+    mse = ((pred_xy - target_xy) ** 2).sum(dim=-1) * mask
+    mse = mse.sum() / mask.sum().clamp(min=1.0)
 
-    tr = SketchCoordDataset(train_csv)
-    va = SketchCoordDataset(val_csv)
-    tr_dl = DataLoader(tr, batch_size=batch, shuffle=True, num_workers=0)
-    va_dl = DataLoader(va, batch_size=batch, shuffle=False, num_workers=0)
+    ce = nn.functional.cross_entropy(
+        pred_pen.reshape(-1, 3),
+        target_pen.reshape(-1),
+        reduction="none",
+    ).reshape(batch_size, seq_len)
+    ce = (ce * mask).sum() / mask.sum().clamp(min=1.0)
+    return mse + ce
 
-    model = CondLSTM(n_classes=n_classes).to(dev)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    mse = nn.MSELoss()
-    ce  = nn.CrossEntropyLoss()
 
-    history = {"epochs": []}
-    best = 1e9
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
 
-    for ep in range(1, epochs+1):
-        t0 = time.time()
+    out_dir = ensure_dir(Path(args.out_dir))
+    manifest_dir = Path(args.rec_out)
+
+    train_manifest = manifest_dir / "manifest_train.csv"
+    val_manifest = manifest_dir / "manifest_val.csv"
+    classes_path = manifest_dir / "classes.txt"
+
+    if not train_manifest.exists():
+        raise FileNotFoundError(f"Missing manifest: {train_manifest}")
+
+    classes = classes_path.read_text().strip().splitlines()
+
+    train_samples = load_manifest(train_manifest)
+    val_samples = load_manifest(val_manifest)
+
+    train_dataset = SketchDataset(train_samples)
+    val_dataset = SketchDataset(val_samples)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch,
+        shuffle=True,
+        collate_fn=collate_sketch,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch,
+        shuffle=False,
+        collate_fn=collate_sketch,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ConditionalLSTM(num_classes=len(classes)).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    history = {"train_loss": [], "val_loss": []}
+    best_val = float("inf")
+    best_path = out_dir / "best_condlstm.pt"
+
+    for epoch in range(1, args.epochs + 1):
         model.train()
-        tr_loss, n = 0.0, 0
+        train_loss = 0.0
+        for batch, lengths, labels in train_loader:
+            batch = batch.to(device)
+            lengths = lengths.to(device)
+            labels = labels.to(device)
 
-        for x, y in tr_dl:
-            x, y = x.to(dev), y.to(dev)
-            xin = x[:, :-1, :]
-            tgt_xy = x[:, 1:, :2]
-            tgt_pen = x[:, 1:, 2:].argmax(dim=-1)
+            inp = batch[:, :-1, :]
+            target = batch[:, 1:, :]
+            target_xy = target[:, :, :2]
+            target_pen = torch.argmax(target[:, :, 2:], dim=-1)
+            lengths_adj = torch.clamp(lengths - 1, min=1)
 
-            pred_xy, pred_pen = model(xin, y)
-            loss = mse(pred_xy, tgt_xy) + ce(pred_pen.reshape(-1,3), tgt_pen.reshape(-1))
-
-            opt.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
+            pred_xy, pred_pen = model(inp, labels)
+            loss = masked_loss(pred_xy, target_xy, pred_pen, target_pen, lengths_adj)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            optimizer.step()
+            train_loss += loss.item() * batch.size(0)
 
-            tr_loss += loss.item()
-            n += 1
-
-        tr_loss /= max(n, 1)
-
+        train_loss = train_loss / max(len(train_dataset), 1)
+        val_loss = 0.0
         model.eval()
-        va_loss, m = 0.0, 0
         with torch.no_grad():
-            for x, y in va_dl:
-                x, y = x.to(dev), y.to(dev)
-                xin = x[:, :-1, :]
-                tgt_xy = x[:, 1:, :2]
-                tgt_pen = x[:, 1:, 2:].argmax(dim=-1)
-                pred_xy, pred_pen = model(xin, y)
-                loss = mse(pred_xy, tgt_xy) + ce(pred_pen.reshape(-1,3), tgt_pen.reshape(-1))
-                va_loss += loss.item()
-                m += 1
-        va_loss /= max(m, 1)
+            for batch, lengths, labels in val_loader:
+                batch = batch.to(device)
+                lengths = lengths.to(device)
+                labels = labels.to(device)
+                inp = batch[:, :-1, :]
+                target = batch[:, 1:, :]
+                target_xy = target[:, :, :2]
+                target_pen = torch.argmax(target[:, :, 2:], dim=-1)
+                lengths_adj = torch.clamp(lengths - 1, min=1)
+                pred_xy, pred_pen = model(inp, labels)
+                loss = masked_loss(pred_xy, target_xy, pred_pen, target_pen, lengths_adj)
+                val_loss += loss.item() * batch.size(0)
+        val_loss = val_loss / max(len(val_dataset), 1)
 
-        dt = time.time() - t0
-        print(f"Epoch {ep}: train_loss={tr_loss:.4f} val_loss={va_loss:.4f} time={dt:.1f}s")
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
 
-        history["epochs"].append({"epoch": ep, "train_loss": tr_loss, "val_loss": va_loss})
-        (OUT_DIR/"history.json").write_text(json.dumps(history, indent=2))
+        print(f"Epoch {epoch:02d} | train loss {train_loss:.4f} | val loss {val_loss:.4f}")
 
-        if va_loss < best:
-            best = va_loss
-            torch.save({"model": model.state_dict(), "classes": classes}, OUT_DIR/"best_condlstm.pt")
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "classes": classes,
+                    "embed_dim": model.embedding.embedding_dim,
+                    "hidden_dim": model.lstm.hidden_size,
+                },
+                best_path,
+            )
 
-    print("Saved:", OUT_DIR/"best_condlstm.pt")
+    history_path = out_dir / "history.json"
+    history_path.write_text(json.dumps(history, indent=2))
+
 
 if __name__ == "__main__":
     main()

@@ -1,86 +1,116 @@
-import csv, random
+"""Dataset for conditional LSTM generation."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-def safe_np_load(path: str):
-    try:
-        return np.load(path, allow_pickle=True)
-    except UnicodeError:
-        return np.load(path, allow_pickle=True, encoding="latin1")
+from src.utils.rasterize_from_npy import extract_coords, safe_np_load
 
-def extract_T4(obj):
-    if isinstance(obj, np.ndarray) and obj.dtype == object and obj.ndim == 0:
-        obj = obj.item()
 
-    if isinstance(obj, np.ndarray) and obj.dtype != object:
-        if obj.ndim == 2 and obj.shape[1] == 4:
-            return obj
-        if obj.ndim == 3 and obj.shape[-1] == 4:
-            return obj[0]
-        raise ValueError(f"Numeric array not (T,4): shape={obj.shape}, dtype={obj.dtype}")
+@dataclass
+class ManifestSample:
+    path: str
+    label: int
+    class_name: str
+    split: str
 
-    if isinstance(obj, (list, tuple)):
-        for it in obj:
-            try:
-                return extract_T4(it)
-            except Exception:
-                pass
-        raise ValueError("No (T,4) inside list/tuple")
 
-    if isinstance(obj, np.ndarray) and obj.dtype == object:
-        for i in range(obj.size):
-            try:
-                return extract_T4(obj.flat[i])
-            except Exception:
-                pass
-        raise ValueError(f"No (T,4) inside object ndarray: shape={obj.shape}")
+def load_manifest(csv_path: Path) -> List[ManifestSample]:
+    df = pd.read_csv(csv_path)
+    required = {"path", "label", "class_name", "split"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Manifest missing columns: {missing}")
+    return [
+        ManifestSample(row.path, int(row.label), row.class_name, row.split)
+        for row in df.itertuples(index=False)
+    ]
 
-    raise ValueError(f"Unsupported type: {type(obj)}")
 
-def to_sketch5(a4: np.ndarray):
-    a4 = np.asarray(a4)
-    assert a4.ndim == 2 and a4.shape[1] == 4, f"Expected (T,4), got {a4.shape}"
+def coords_to_sketch5(coords: np.ndarray) -> np.ndarray:
+    """Convert coords array to sketch-5 [dx,dy,p1,p2,p3]."""
 
-    xy = a4[:, :2].astype(np.float32)
-    pen2 = a4[:, 2:4].astype(np.float32)
+    coords = np.asarray(coords)
+    if coords.ndim != 2 or coords.shape[1] < 2:
+        raise ValueError("coords must be (T,>=2)")
 
-    if float(np.max(np.abs(xy))) > 50.0:
-        xy = np.diff(xy, axis=0, prepend=xy[:1])
+    xy = coords[:, :2].astype(np.float32)
+    max_abs = float(np.max(np.abs(xy))) if xy.size else 0.0
+    if max_abs > 20.0:
+        deltas = np.diff(xy, axis=0, prepend=xy[:1])
+    else:
+        deltas = xy
+        xy = np.cumsum(deltas, axis=0)
 
-    pen2 = (pen2 > 0.5).astype(np.float32)
-    last = pen2[-1]
-    eos_col = int(np.argmax(last)) if last.sum() >= 1 else 1
+    pen_up = None
+    if coords.shape[1] >= 3:
+        pen_col = coords[:, 2]
+        if np.isin(pen_col, [0, 1]).all():
+            pen_up = pen_col.astype(np.int64)
 
-    eos = pen2[:, eos_col]
-    stroke_end = pen2[:, 1 - eos_col]
-    cont = 1.0 - np.clip(stroke_end + eos, 0.0, 1.0)
+    if pen_up is None and coords.shape[1] >= 4:
+        pen_cols = coords[:, 2:4]
+        if np.isin(pen_cols, [0, 1]).all():
+            pen_down = pen_cols[:, 0]
+            pen_up = pen_cols[:, 1]
+        else:
+            pen_up = np.zeros(len(coords), dtype=np.int64)
+            pen_up[-1] = 1
+    elif pen_up is None:
+        pen_up = np.zeros(len(coords), dtype=np.int64)
+        pen_up[-1] = 1
 
-    return np.concatenate([xy, cont[:, None], stroke_end[:, None], eos[:, None]], axis=1).astype(np.float32)
+    pen_down = 1 - pen_up
+    eos = np.zeros(len(coords), dtype=np.int64)
+    eos[-1] = 1
 
-class SketchCoordDataset(Dataset):
-    def __init__(self, manifest_csv: str, max_retries: int = 10, seed: int = 0):
-        self.rows = []
-        with open(manifest_csv, "r", newline="") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                self.rows.append((row["path"], int(row["label"])))
+    sketch = np.zeros((len(coords), 5), dtype=np.float32)
+    sketch[:, 0:2] = deltas
+    sketch[:, 2] = pen_down
+    sketch[:, 3] = pen_up
+    sketch[:, 4] = eos
+    return sketch
+
+
+class SketchDataset(Dataset):
+    """Dataset that returns sketch-5 sequences and labels."""
+
+    def __init__(self, samples: List[ManifestSample], max_retries: int = 5):
+        self.samples = samples
         self.max_retries = max_retries
-        self.rng = random.Random(seed)
 
-    def __len__(self): return len(self.rows)
+    def __len__(self) -> int:
+        return len(self.samples)
 
-    def __getitem__(self, idx):
-        for _ in range(self.max_retries):
-            path, y = self.rows[idx]
+    def __getitem__(self, idx: int):
+        for attempt in range(self.max_retries):
+            sample = self.samples[idx]
             try:
-                raw = safe_np_load(path)
-                a4 = extract_T4(raw)
-                x = to_sketch5(a4)
-                return torch.from_numpy(x), torch.tensor(y, dtype=torch.long)
+                arr = safe_np_load(sample.path)
+                coords = extract_coords(arr)
+                if coords is None:
+                    raise ValueError("Invalid coords")
+                sketch = coords_to_sketch5(coords)
+                return torch.from_numpy(sketch), sample.label
             except Exception:
-                idx = self.rng.randrange(len(self.rows))
+                idx = (idx + 1) % len(self.samples)
+        raise RuntimeError("Failed to load sketch after retries")
 
-        x = np.zeros((100,5), dtype=np.float32)
-        x[-1, 4] = 1.0
-        return torch.from_numpy(x), torch.tensor(0, dtype=torch.long)
+
+def collate_sketch(batch: List[Tuple[torch.Tensor, int]]):
+    sequences, labels = zip(*batch)
+    lengths = torch.tensor([seq.shape[0] for seq in sequences], dtype=torch.long)
+    max_len = max(lengths).item()
+
+    padded = torch.zeros((len(sequences), max_len, 5), dtype=torch.float32)
+    for i, seq in enumerate(sequences):
+        padded[i, : seq.shape[0]] = seq
+    labels = torch.tensor(labels, dtype=torch.long)
+    return padded, lengths, labels
