@@ -24,8 +24,15 @@ class ConditionalLSTM(nn.Module):
         self.fc_pen = nn.Linear(hidden_dim, 3)
 
     def forward(self, x: torch.Tensor, labels: torch.Tensor):
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        if labels.dim() == 0:
+            labels = labels.unsqueeze(0)
+        labels = labels.view(-1)
+        if labels.numel() == 1 and x.size(0) > 1:
+            labels = labels.expand(x.size(0))
         emb = self.embedding(labels)
-        emb = emb[:, None, :].expand(-1, x.size(1), -1)
+        emb = emb.unsqueeze(1).expand(x.size(0), x.size(1), -1)
         lstm_in = torch.cat([x, emb], dim=-1)
         out, _ = self.lstm(lstm_in)
         xy = self.fc_xy(out)

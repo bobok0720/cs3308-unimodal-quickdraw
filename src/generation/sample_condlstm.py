@@ -56,7 +56,7 @@ def sample_class(model: ConditionalLSTM, label: int, T: int, temp: float, device
             pen_onehot[pen_state] = 1.0
             step = torch.cat([dxdy, pen_onehot], dim=0)
             steps.append(step.cpu().numpy())
-            prev = step
+            prev = step.unsqueeze(0)
 
             if pen_state == 2:
                 break
