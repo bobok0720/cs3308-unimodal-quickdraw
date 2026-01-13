@@ -1,0 +1,11 @@
+seed: 42
+img_size: 64
+recognition:
+  epochs: 10
+  batch: 64
+  lr: 0.001
+generation:
+  epochs: 10
+  batch: 64
+  lr: 0.001
+  temp: 0.7

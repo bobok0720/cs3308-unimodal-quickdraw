@@ -1,32 +1,82 @@
-from pathlib import Path
+"""Build train/val/test manifests from coordinate .npy files."""
+
+from __future__ import annotations
+
+import argparse
 import csv
-import sys
+import random
+from pathlib import Path
+from typing import Dict, List
 
-COORD_ROOT = Path(sys.argv[1])
-OUT_DIR = Path(sys.argv[2])
-OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-for split in ["train", "val", "test"]:
-    split_dir = COORD_ROOT / split
-    if not split_dir.exists():
-        print(f"[WARN] missing split folder: {split_dir}")
-        continue
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build coordinate manifests")
+    parser.add_argument("--coord_root", type=str, required=True, help="Root directory of coord class folders")
+    parser.add_argument("--out_dir", type=str, required=True, help="Output directory for manifests")
+    parser.add_argument("--val_frac", type=float, default=0.1)
+    parser.add_argument("--test_frac", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--tiny_classes", type=str, nargs="*", default=None, help="Optional class list for tiny split")
+    parser.add_argument("--tiny_per_class", type=int, default=None, help="Max samples per class in tiny mode")
+    return parser.parse_args()
 
-    # class names = folder names under split
-    classes = sorted([p.name for p in split_dir.iterdir() if p.is_dir()])
-    class_to_idx = {c:i for i,c in enumerate(classes)}
 
-    out_csv = OUT_DIR / f"manifest_{split}.csv"
-    with out_csv.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["path", "label", "class_name"])
-        n = 0
-        for c in classes:
-            cdir = split_dir / c
-            for fp in cdir.rglob("*.npy"):
-                w.writerow([str(fp), class_to_idx[c], c])
-                n += 1
-        print(f"{split}: {n} files, {len(classes)} classes -> {out_csv}")
+def main() -> None:
+    args = parse_args()
+    coord_root = Path(args.coord_root)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save class list for later
-    (OUT_DIR / "classes.txt").write_text("\n".join(classes), encoding="utf-8")
+    if not coord_root.exists():
+        raise FileNotFoundError(f"coord_root not found: {coord_root}")
+
+    classes = sorted([p.name for p in coord_root.iterdir() if p.is_dir()])
+    if args.tiny_classes:
+        classes = [c for c in classes if c in args.tiny_classes]
+    if not classes:
+        raise ValueError("No classes found")
+
+    random.seed(args.seed)
+    rows = {"train": [], "val": [], "test": []}
+
+    for label, class_name in enumerate(classes):
+        class_dir = coord_root / class_name
+        files = sorted([p for p in class_dir.glob("*.npy")])
+        if args.tiny_per_class:
+            random.shuffle(files)
+            files = files[: args.tiny_per_class]
+        random.shuffle(files)
+        n_total = len(files)
+        n_val = int(n_total * args.val_frac)
+        n_test = int(n_total * args.test_frac)
+        n_train = n_total - n_val - n_test
+
+        splits = (
+            ["train"] * n_train
+            + ["val"] * n_val
+            + ["test"] * n_test
+        )
+
+        for path, split in zip(files, splits):
+            rows[split].append(
+                {
+                    "path": str(path.resolve()),
+                    "label": label,
+                    "class_name": class_name,
+                    "split": split,
+                }
+            )
+
+    for split, split_rows in rows.items():
+        out_path = out_dir / f"manifest_{split}.csv"
+        with out_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["path", "label", "class_name", "split"])
+            writer.writeheader()
+            writer.writerows(split_rows)
+
+    (out_dir / "classes.txt").write_text("\n".join(classes))
+    print(f"Wrote manifests to {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
