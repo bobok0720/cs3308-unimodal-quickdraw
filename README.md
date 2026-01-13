@@ -6,8 +6,7 @@ This repo provides an end-to-end pipeline for coordinate-based **recognition** a
 
 1. **Clone this repo** into your Drive or local Colab session.
 2. **Open** `notebooks/99_full_pipeline_clean.ipynb`.
-3. **Run Section A (Setup)** and point `COORD_ROOT` at your data, e.g.
-   `/content/drive/MyDrive/cs3308_quickdraw/data/quickdraw414k/QuickDraw414k/coordinate_files`.
+3. **Run Section A (Setup)** and point `COORD_ROOT` at your data.
 4. **Run Sections B–E** end-to-end.
 
 **Expected outputs**:
@@ -16,6 +15,41 @@ This repo provides an end-to-end pipeline for coordinate-based **recognition** a
 - Generation checkpoint under `outputs/generation/best_condlstm.pt`
 - Generated samples under `figures/gen_samples/<class>/*.png`
 - Evaluation metrics under `outputs/eval/metrics.json` and `outputs/eval/confusion_matrix.png`
+
+## Colab Smoke Test (Recognition)
+
+```bash
+# Clone repo
+repo_root="$HOME/cs3308-unimodal-quickdraw"
+git clone https://github.com/CS3308/cs3308-unimodal-quickdraw.git "$repo_root"
+cd "$repo_root"
+
+# Install deps
+python -m pip install -r requirements.txt
+
+# Mount Drive (for data access)
+python - <<'PY'
+from google.colab import drive
+
+drive.mount("/content/drive")
+PY
+
+# Point this to your QuickDraw414k coordinate_files folder
+COORD_ROOT=/path/to/QuickDraw414k/coordinate_files
+
+# Build manifests (small subset)
+python scripts/build_coord_manifest.py \
+  --coord_root "$COORD_ROOT" \
+  --out_dir outputs/manifests \
+  --num_classes 5 \
+  --max_per_class 300
+
+# Train recognizer (2 epochs)
+python -m src.recognition.train_from_coords \
+  --rec_out outputs/manifests \
+  --out_dir outputs/recognition \
+  --epochs 2
+```
 
 ## Local Run
 
@@ -29,7 +63,7 @@ python scripts/build_coord_manifest.py \
 
 # Train recognizer
 python -m src.recognition.train_from_coords \
-  --coord_root outputs/manifests \
+  --rec_out outputs/manifests \
   --out_dir outputs/recognition
 
 # Train generator + sample

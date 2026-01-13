@@ -11,14 +11,24 @@ from typing import Dict, List
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build coordinate manifests")
-    parser.add_argument("--coord_root", type=str, required=True, help="Root directory of coord class folders")
+    parser.add_argument(
+        "--coord_root",
+        type=str,
+        required=True,
+        help="Root directory containing train/val/test subfolders",
+    )
     parser.add_argument("--out_dir", type=str, required=True, help="Output directory for manifests")
-    parser.add_argument("--val_frac", type=float, default=0.1)
-    parser.add_argument("--test_frac", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--tiny_classes", type=str, nargs="*", default=None, help="Optional class list for tiny split")
-    parser.add_argument("--tiny_per_class", type=int, default=None, help="Max samples per class in tiny mode")
+    parser.add_argument("--num_classes", type=int, default=None, help="Optional max number of classes")
+    parser.add_argument("--max_per_class", type=int, default=None, help="Optional max samples per class per split")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for shuffling")
     return parser.parse_args()
+
+
+def _collect_classes(train_root: Path, num_classes: int | None) -> List[str]:
+    classes = sorted([p.name for p in train_root.iterdir() if p.is_dir()])
+    if num_classes is not None:
+        classes = classes[:num_classes]
+    return classes
 
 
 def main() -> None:
@@ -30,47 +40,51 @@ def main() -> None:
     if not coord_root.exists():
         raise FileNotFoundError(f"coord_root not found: {coord_root}")
 
-    classes = sorted([p.name for p in coord_root.iterdir() if p.is_dir()])
-    if args.tiny_classes:
-        classes = [c for c in classes if c in args.tiny_classes]
-    if not classes:
-        raise ValueError("No classes found")
+    split_roots = {
+        "train": coord_root / "train",
+        "val": coord_root / "val",
+        "test": coord_root / "test",
+    }
+    for split, split_root in split_roots.items():
+        if not split_root.is_dir():
+            raise FileNotFoundError(f"Missing {split} directory: {split_root}")
 
-    random.seed(args.seed)
-    rows = {"train": [], "val": [], "test": []}
+    classes = _collect_classes(split_roots["train"], args.num_classes)
+    if not classes:
+        raise RuntimeError(f"No class folders found under {split_roots['train']}")
+
+    rng = random.Random(args.seed)
+    rows: Dict[str, List[Dict[str, str | int]]] = {"train": [], "val": [], "test": []}
 
     for label, class_name in enumerate(classes):
-        class_dir = coord_root / class_name
-        files = sorted([p for p in class_dir.glob("*.npy")])
-        if args.tiny_per_class:
-            random.shuffle(files)
-            files = files[: args.tiny_per_class]
-        random.shuffle(files)
-        n_total = len(files)
-        n_val = int(n_total * args.val_frac)
-        n_test = int(n_total * args.test_frac)
-        n_train = n_total - n_val - n_test
+        for split, split_root in split_roots.items():
+            class_dir = split_root / class_name
+            if not class_dir.is_dir():
+                raise FileNotFoundError(f"Missing class folder for {split}: {class_dir}")
+            files = sorted(class_dir.glob("*.npy"))
+            rng.shuffle(files)
+            if args.max_per_class is not None:
+                files = files[: args.max_per_class]
+            for path in files:
+                rows[split].append(
+                    {
+                        "path": str(path.resolve()),
+                        "label": label,
+                        "class": class_name,
+                    }
+                )
 
-        splits = (
-            ["train"] * n_train
-            + ["val"] * n_val
-            + ["test"] * n_test
+    if not rows["train"]:
+        raise RuntimeError(
+            "Train manifest would be empty. "
+            f"Check that .npy files exist under {split_roots['train']}"
         )
 
-        for path, split in zip(files, splits):
-            rows[split].append(
-                {
-                    "path": str(path.resolve()),
-                    "label": label,
-                    "class_name": class_name,
-                    "split": split,
-                }
-            )
-
     for split, split_rows in rows.items():
+        rng.shuffle(split_rows)
         out_path = out_dir / f"manifest_{split}.csv"
         with out_path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["path", "label", "class_name", "split"])
+            writer = csv.DictWriter(f, fieldnames=["path", "label", "class"])
             writer.writeheader()
             writer.writerows(split_rows)
 
