@@ -11,27 +11,78 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from src.utils.rasterize_from_npy import extract_coords, safe_np_load
-
-
 @dataclass
 class ManifestSample:
     path: str
     label: int
-    class_name: str
-    split: str
+    class_name: str = ""
 
 
 def load_manifest(csv_path: Path) -> List[ManifestSample]:
     df = pd.read_csv(csv_path)
-    required = {"path", "label", "class_name", "split"}
+    column_map = {}
+    if "path" not in df.columns and "filepath" in df.columns:
+        column_map["filepath"] = "path"
+    if "class" not in df.columns and "class_name" in df.columns:
+        column_map["class_name"] = "class"
+    if column_map:
+        df = df.rename(columns=column_map)
+
+    required = {"path", "label"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Manifest missing columns: {missing}")
     return [
-        ManifestSample(row.path, int(row.label), row.class_name, row.split)
-        for row in df.itertuples(index=False)
+        ManifestSample(
+            path=str(row_dict["path"]),
+            label=int(row_dict["label"]),
+            class_name=str(row_dict.get("class", "")),
+        )
+        for row_dict in (row._asdict() for row in df.itertuples(index=False))
     ]
+
+
+def load_npy(path: str):
+    try:
+        return np.load(path, allow_pickle=True)
+    except UnicodeError:
+        return np.load(path, allow_pickle=True, encoding="latin1")
+
+
+def unwrap_coords(obj, max_depth: int = 10) -> Optional[np.ndarray]:
+    depth = 0
+    while depth < max_depth:
+        depth += 1
+        if isinstance(obj, np.ndarray):
+            if obj.dtype == object and obj.size == 1:
+                try:
+                    obj = obj.item()
+                    continue
+                except Exception:
+                    return None
+            if obj.ndim == 3 and obj.shape[0] == 1:
+                obj = obj[0]
+                continue
+            if obj.ndim == 2 and obj.shape[1] >= 2:
+                if np.issubdtype(obj.dtype, np.number):
+                    return obj
+                try:
+                    arr = obj.astype(np.float32)
+                    if np.issubdtype(arr.dtype, np.number):
+                        return arr
+                except Exception:
+                    return None
+        if isinstance(obj, (list, tuple)):
+            if len(obj) == 1:
+                obj = obj[0]
+                continue
+            try:
+                obj = np.asarray(obj)
+                continue
+            except Exception:
+                return None
+        return None
+    return None
 
 
 def coords_to_sketch5(coords: np.ndarray) -> np.ndarray:
@@ -93,11 +144,13 @@ class SketchDataset(Dataset):
         for attempt in range(self.max_retries):
             sample = self.samples[idx]
             try:
-                arr = safe_np_load(sample.path)
-                coords = extract_coords(arr)
+                arr = load_npy(sample.path)
+                coords = unwrap_coords(arr)
                 if coords is None:
                     raise ValueError("Invalid coords")
                 sketch = coords_to_sketch5(coords)
+                if sketch.ndim != 2 or sketch.shape[1] != 5 or sketch.shape[0] == 0:
+                    raise ValueError("Invalid sketch shape")
                 return torch.from_numpy(sketch), sample.label
             except Exception:
                 idx = (idx + 1) % len(self.samples)
